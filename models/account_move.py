@@ -79,7 +79,7 @@ class AccountMoveInherit(models.Model):
         args = args or []
 
         state = ['posted']
-        payment_state = ['not_paid', 'in_payment']
+        payment_state = ['not_paid', 'in_payment','partial']
 
 
         if self._context.get('partner_id') and self._context.get('type'):
@@ -95,8 +95,8 @@ class AccountMoveInherit(models.Model):
             else:
                 move_type = 'in_invoice'
             
-            args += [('partner_id','=',partner_id),('type','=',move_type),
-            ('state','in',state),('invoice_payment_state','in',payment_state)]
+            args += [('partner_id','=',partner_id),('move_type','=',move_type),
+            ('state','in',state),('payment_state','in',payment_state)]
 
         return super(AccountMoveInherit, self)._name_search(name=name, args=args, operator=operator, limit=limit, name_get_uid=name_get_uid)
 
@@ -257,8 +257,7 @@ class AccountMoveLineInherit(models.Model):
                 ('account_id.reconcile', '=', True),
                 ('reconciled', '=', False),
                 ('in_payment', '=', False),
-                ('move_id.type','!=','entry'),
-                # ('account_id.internal_type', '=', 'payable'),
+                ('move_id.move_type','!=','entry'),
                 ('move_id.state', '=', 'posted'),
             ]
 
@@ -273,7 +272,7 @@ class AccountMoveLineInherit(models.Model):
                 ('account_id.reconcile', '=', True),
                 ('reconciled', '=', False),
                 ('in_payment', '=', False),
-                ('move_id.type','!=','entry'),
+                ('move_id.move_type','!=','entry'),
                 ('move_id.state', '=', 'posted'),
             ]
 
@@ -281,7 +280,6 @@ class AccountMoveLineInherit(models.Model):
             partner_id = int(self._context.get('partner_id'))
             args = ['|', ('move_id.state', '=', 'posted'), '&', 
                 ('move_id.state', '=', 'draft'), 
-                ('journal_id.post_at', '=', 'bank_rec'),
                 ('partner_id', '=', partner_id),
                 ('reconciled', '=', False), '|', 
                 ('amount_residual', '!=', 0.0),
@@ -499,60 +497,5 @@ class AccountPartialReconcileInherit(models.Model):
         return super(AccountPartialReconcileInherit, self).unlink()
 
 
-    def _prepare_payment_moves(self):
-        for payment in self:
-            if self._context.get('amount_to_pay'):
-                amount = self._context.get('amount_to_pay')
-                in_payment = True
-            else:
-                amount = self._context.get('amount_remain')
-                in_payment = False
 
-            destination_account_id = False
-            debit = credit = 0.00
-
-            current_balance = self._context.get('current_balance')
-
-            account_id = self._context.get('account_id')
-            partner_id = self._context.get('partner_id').commercial_partner_id.id
-
-            amount_currency = self._context.get('amount_currency')
-            currency_id = self._context.get('currency_id')
-            move_name = self._context.get('move_name')
-
-            if current_balance > 0.0:
-                credit = amount
-                debit = 0.00
-                amount_currency = -amount_currency
-
-            if current_balance < 0.0:
-                credit = 0.00
-                debit = amount
-                
-
-            all_move_vals = []
-
-            move_vals = {
-                'line_ids': [
-                    # Receivable / Payable / Transfer line.
-                    (0, 0, {
-                        'name': move_name,
-                        'amount_currency': amount_currency,
-                        'currency_id': currency_id,
-                        'debit': debit,
-                        'credit': credit,
-                        'date_maturity': fields.Date.context_today(self),
-                        'partner_id': partner_id or False,
-                        'account_id': account_id or False,
-                        'payment_id': False,
-                        'in_payment': in_payment,
-                        'exclude_from_invoice_tab' : True,
-                        'last_line_number' : int(self._context.get('last_line_number', 0)),
-                    }),
-                ]
-            }
-
-            all_move_vals.append(move_vals)
-
-            return all_move_vals
 

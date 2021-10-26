@@ -17,10 +17,10 @@ import base64
 class AccontPayment(models.Model):
     _inherit = 'account.payment'
 
-    @api.depends('move_reconciled','move_line_ids.reconciled')
+    @api.depends('is_reconciled','move_id.line_ids.reconciled')
     def move_reconciled_store(self):
         for payment in self:
-            payment.store_move_reconciled = payment.move_reconciled
+            payment.store_move_reconciled = payment.is_reconciled
 
     store_move_reconciled = fields.Boolean('Reconciled Move', compute="move_reconciled_store", store=True, copy=False)
     last_amount = fields.Float('Last Amount', default=0.00)
@@ -28,7 +28,6 @@ class AccontPayment(models.Model):
     @api.model
     def _name_search(self, name, args=None, operator='ilike', limit=100, name_get_uid=None):
         args = args or []
-
         if self._context.get('partner_id') and self._context.get('partner_type'):
             partner_id = int(self._context.get('partner_id'))
             if self._context.get('partner_type') == 'customer':
@@ -36,244 +35,129 @@ class AccontPayment(models.Model):
             else:
                 partner_type = 'supplier'
 
-            state = ['posted','reconciled']
             args += [('partner_id','=',partner_id),('partner_type','=',partner_type),
-            ('state','in',state),('store_move_reconciled','=',False)]
+            ('state','=','posted'),('store_move_reconciled','=',False)]
 
         return super(AccontPayment, self)._name_search(name=name, args=args, operator=operator, limit=limit, name_get_uid=name_get_uid)
 
 
 
-    def _prepare_payment_moves(self):
-        ''' Prepare the creation of journal entries (account.move) by creating a list of python dictionary to be passed
-        to the 'create' method.
 
-        Example 1: outbound with write-off:
 
-        Account             | Debit     | Credit
-        ---------------------------------------------------------
-        BANK                |   900.0   |
-        RECEIVABLE          |           |   1000.0
-        WRITE-OFF ACCOUNT   |   100.0   |
-
-        Example 2: internal transfer from BANK to CASH:
-
-        Account             | Debit     | Credit
-        ---------------------------------------------------------
-        BANK                |           |   1000.0
-        TRANSFER            |   1000.0  |
-        CASH                |   1000.0  |
-        TRANSFER            |           |   1000.0
-
-        :return: A list of Python dictionary to be passed to env['account.move'].create.
-        ''' 
-        
-
+    def _prepare_move_line_default_vals(self, write_off_line_vals=None):
+        ''' Prepare the dictionary to create the default account.move.lines for the current payment.
+        :param write_off_line_vals: Optional dictionary to create a write-off account.move.line easily containing:
+            * amount:       The amount to be added to the counterpart amount.
+            * name:         The label to set on the line.
+            * account_id:   The account on which create the write-off.
+        :return: A list of python dictionary to be passed to the account.move.line's 'create' method.
+        '''
         if self._context.get('amount_to_pay') or self._context.get('amount_remain'):
-            all_move_vals = []
-            for payment in self:
-                company_currency = payment.company_id.currency_id
-                move_names = payment.move_name.split(payment._get_move_name_transfer_separator()) if payment.move_name else None
 
-                if self._context.get('amount_to_pay'):
-                    amount = self._context.get('amount_to_pay')
-                    in_payment = True
-                else:
-                    amount = self._context.get('amount_remain')
-                    in_payment = False
+            self.ensure_one()
+            write_off_line_vals = write_off_line_vals or {}
 
-                payment_type = self._context.get('payment_type')
+            if not self.journal_id.payment_debit_account_id or not self.journal_id.payment_credit_account_id:
+                raise UserError(_(
+                    "You can't create a new payment without an outstanding payments/receipts account set on the %s journal.",
+                    self.journal_id.display_name))
 
-                currency_id = self._context.get('currency_id', False)
-               
-                
-                # Compute amounts.
-                write_off_amount = payment.payment_difference_handling == 'reconcile' and -payment.payment_difference or 0.0
-                if payment.payment_type in ('outbound', 'transfer') or payment.payment_type == payment_type:
-                    counterpart_amount = amount
-                    liquidity_line_account = payment.journal_id.default_debit_account_id
-                else:
-                    counterpart_amount = -amount
-                    liquidity_line_account = payment.journal_id.default_credit_account_id
+            if self._context.get('amount_to_pay'):
+                amount = self._context.get('amount_to_pay')
+                in_payment = True
+            else:
+                amount = self._context.get('amount_remain')
+                in_payment = False
 
-               
-                # Manage currency.
-                if currency_id and currency_id != company_currency:
-                    balance = currency_id._convert(counterpart_amount, company_currency, payment.company_id, payment.payment_date)
-                    write_off_balance = currency_id._convert(write_off_amount, company_currency, payment.company_id, payment.payment_date)
-                    currency_id = currency_id.id
-                    
-                elif currency_id == company_currency:
-                    # Single-currency.
-                    balance = counterpart_amount
-                    write_off_balance = write_off_amount
-                    counterpart_amount = write_off_amount = 0.0
-                    currency_id = False
-               
-                else:
-                    # Multi-currencies.
-                    balance = payment.currency_id._convert(counterpart_amount, company_currency, payment.company_id, payment.payment_date)
-                    write_off_balance = payment.currency_id._convert(write_off_amount, company_currency, payment.company_id, payment.payment_date)
-                    currency_id = payment.currency_id.id
-                 
-                # Manage custom currency on journal for liquidity line.
-                if payment.journal_id.currency_id and payment.currency_id != payment.journal_id.currency_id:
-                    # Custom currency on journal.
-                    if payment.journal_id.currency_id == company_currency:
-                        # Single-currency
-                        liquidity_line_currency_id = False
-                    else:
-                        liquidity_line_currency_id = payment.journal_id.currency_id.id
-                    liquidity_amount = company_currency._convert(
-                        balance, payment.journal_id.currency_id, payment.company_id, payment.payment_date)
-                elif self._context.get('currency_id'):
-                    liquidity_line_currency_id = self._context.get('currency_id').id
-                    liquidity_amount = company_currency._convert(
-                        balance, self._context.get('currency_id'), payment.company_id, payment.payment_date)
-                else:
-                    # Use the payment currency.
-                    liquidity_line_currency_id = currency_id
-                    liquidity_amount = counterpart_amount
+            payment_type = self._context.get('payment_type')
 
-               
-                # Compute 'name' to be used in receivable/payable line.
+            currency_id = self._context.get('currency_id', False)
+            # Compute amounts.
+            write_off_amount = write_off_line_vals.get('amount', 0.0)
 
-                # 5/0
+            if self.payment_type == 'inbound':
+                # Receive money.
+                counterpart_amount = -amount
+                write_off_amount *= -1
+            elif self.payment_type == 'outbound':
+                # Send money.
+                counterpart_amount = amount
+            else:
+                counterpart_amount = 0.0
+                write_off_amount = 0.0
 
-                rec_pay_line_name = ''
-                if payment.payment_type == 'transfer':
-                    rec_pay_line_name = payment.name
-                else:
-                    if payment.partner_type == 'customer':
-                        if payment.payment_type == 'inbound':
-                            rec_pay_line_name += _("Customer Payment")
-                        elif payment.payment_type == 'outbound':
-                            rec_pay_line_name += _("Customer Credit Note")
-                    elif payment.partner_type == 'supplier':
-                        if payment.payment_type == 'inbound':
-                            rec_pay_line_name += _("Vendor Credit Note")
-                        elif payment.payment_type == 'outbound':
-                            rec_pay_line_name += _("Vendor Payment")
-                    if payment.invoice_ids:
-                        rec_pay_line_name += ': %s' % ', '.join(payment.invoice_ids.mapped('name'))
+            balance = self.currency_id._convert(counterpart_amount, self.company_id.currency_id, self.company_id, self.date)
+            counterpart_amount_currency = counterpart_amount
+            write_off_balance = self.currency_id._convert(write_off_amount, self.company_id.currency_id, self.company_id, self.date)
+            write_off_amount_currency = write_off_amount
+            currency_id = self.currency_id.id
 
-                # Compute 'name' to be used in liquidity line.
-                if payment.payment_type == 'transfer':
-                    liquidity_line_name = _('Transfer to %s') % payment.destination_journal_id.name
-                else:
-                    liquidity_line_name = payment.name
-
-                # ==== 'inbound' / 'outbound' ====
-
-                if not payment.partner_id:
-                    partner_id = self._context.get('partner_id').id
-                else:
-                    partner_id = payment.partner_id.id
-
-                if self._context.get('account_id'):
-                    account_id = self._context.get('account_id')
-                else:
-                    account_id = payment.destination_account_id.id
-
-                move_vals = {
-                    'date': payment.payment_date,
-                    'ref': payment.communication,
-                    'journal_id': payment.journal_id.id,
-                    'currency_id': payment.journal_id.currency_id.id or payment.company_id.currency_id.id,
-                    'partner_id': payment.partner_id.id,
-                    'line_ids': [
-                        # Receivable / Payable / Transfer line.
-                        (0, 0, {
-                            'name': rec_pay_line_name,
-                            'amount_currency': counterpart_amount + write_off_amount if currency_id else 0.0,
-                            'currency_id': currency_id,
-                            'debit': balance + write_off_balance > 0.0 and balance + write_off_balance or 0.0,
-                            'credit': balance + write_off_balance < 0.0 and -balance - write_off_balance or 0.0,
-                            'date_maturity': payment.payment_date,
-                            'partner_id': partner_id or False,
-                            'account_id': account_id,
-                            'payment_id': payment.id,
-                            'in_payment': in_payment,
-                            'last_line_number' : int(self._context.get('last_line_number', 0)),
-                        }),
-                
-                    ],
-                }
-                if write_off_balance:
-                    # Write-off line.
-                    move_vals['line_ids'].append((0, 0, {
-                        'name': payment.writeoff_label,
-                        'amount_currency': -write_off_amount,
-                        'currency_id': currency_id,
-                        'debit': write_off_balance < 0.0 and -write_off_balance or 0.0,
-                        'credit': write_off_balance > 0.0 and write_off_balance or 0.0,
-                        'date_maturity': payment.payment_date,
-                        'partner_id': payment.partner_id.commercial_partner_id.id,
-                        'account_id': payment.writeoff_account_id.id,
-                        'payment_id': payment.id,
-                    }))
-
-                if move_names:
-                    move_vals['name'] = move_names[0]
-
-                all_move_vals.append(move_vals)
+            if self.is_internal_transfer:
+                if self.payment_type == 'inbound':
+                    liquidity_line_name = _('Transfer to %s', self.journal_id.name)
+                else: 
+                    liquidity_line_name = _('Transfer from %s', self.journal_id.name)
+            else:
+                liquidity_line_name = self.payment_reference
 
 
-                # ==== 'transfer' ====
-                if payment.payment_type == 'transfer':
-                    journal = payment.destination_journal_id
+            if not self.partner_id:
+                partner_id = self._context.get('partner_id').id
+            else:
+                partner_id = self.partner_id.id
 
-                    # Manage custom currency on journal for liquidity line.
-                    if journal.currency_id and payment.currency_id != journal.currency_id:
-                        # Custom currency on journal.
-                        liquidity_line_currency_id = journal.currency_id.id
-                        transfer_amount = company_currency._convert(balance, journal.currency_id, payment.company_id, payment.payment_date)
-                    else:
-                        # Use the payment currency.
-                        liquidity_line_currency_id = currency_id
-                        transfer_amount = counterpart_amount
+            if self._context.get('account_id'):
+                account_id = self._context.get('account_id')
+            else:
+                account_id = self.destination_account_id.id
+            # Compute a default label to set on the journal items.
 
-                    transfer_move_vals = {
-                        'date': payment.payment_date,
-                        'ref': payment.communication,
-                        'partner_id': payment.partner_id.id,
-                        'journal_id': payment.destination_journal_id.id,
-                        'line_ids': [
-                            # Transfer debit line.
-                            (0, 0, {
-                                'name': payment.name,
-                                'amount_currency': -counterpart_amount if currency_id else 0.0,
-                                'currency_id': currency_id,
-                                'debit': balance < 0.0 and -balance or 0.0,
-                                'credit': balance > 0.0 and balance or 0.0,
-                                'date_maturity': payment.payment_date,
-                                'partner_id': payment.partner_id.commercial_partner_id.id,
-                                'account_id': payment.company_id.transfer_account_id.id,
-                                'payment_id': payment.id,
-                            }),
-                            # Liquidity credit line.
-                            (0, 0, {
-                                'name': _('Transfer from %s') % payment.journal_id.name,
-                                'amount_currency': transfer_amount if liquidity_line_currency_id else 0.0,
-                                'currency_id': liquidity_line_currency_id,
-                                'debit': balance > 0.0 and balance or 0.0,
-                                'credit': balance < 0.0 and -balance or 0.0,
-                                'date_maturity': payment.payment_date,
-                                'partner_id': payment.partner_id.commercial_partner_id.id,
-                                'account_id': payment.destination_journal_id.default_credit_account_id.id,
-                                'payment_id': payment.id,
-                            }),
-                        ],
-                    }
+            payment_display_name = {
+                'outbound-customer': _("Customer Reimbursement"),
+                'inbound-customer': _("Customer Payment"),
+                'outbound-supplier': _("Vendor Payment"),
+                'inbound-supplier': _("Vendor Reimbursement"),
+            }
 
-                    if move_names and len(move_names) == 2:
-                        transfer_move_vals['name'] = move_names[1]
+            default_line_name = self.env['account.move.line']._get_default_line_name(
+                _("Internal Transfer") if self.is_internal_transfer else payment_display_name['%s-%s' % (self.payment_type, self.partner_type)],
+                self.amount,
+                self.currency_id,
+                self.date,
+                partner=self.partner_id,
+            )
 
-                    all_move_vals.append(transfer_move_vals)
-            return all_move_vals
+            line_vals_list = [
+
+                # Receivable / Payable.
+                {
+                    'name': self.payment_reference or default_line_name,
+                    'date_maturity': self.date,
+                    'amount_currency': counterpart_amount_currency + write_off_amount_currency if currency_id else 0.0,
+                    'currency_id': currency_id,
+                    'debit': balance + write_off_balance > 0.0 and balance + write_off_balance or 0.0,
+                    'credit': balance + write_off_balance < 0.0 and -balance - write_off_balance or 0.0,
+                    'partner_id': partner_id or False,
+                    'account_id': account_id,
+                    'in_payment': in_payment,
+                    'last_line_number' : int(self._context.get('last_line_number', 0)),
+
+                },
+            ]
+            if write_off_balance:
+                # Write-off line.
+                line_vals_list.append({
+                    'name': write_off_line_vals.get('name') or default_line_name,
+                    'amount_currency': -write_off_amount_currency,
+                    'currency_id': currency_id,
+                    'debit': write_off_balance < 0.0 and -write_off_balance or 0.0,
+                    'credit': write_off_balance > 0.0 and write_off_balance or 0.0,
+                    'partner_id': self.partner_id.id,
+                    'account_id': write_off_line_vals.get('account_id'),
+                })
+            return line_vals_list    
         else:
-            return super(AccontPayment, self)._prepare_payment_moves()
-            
+            return super(AccontPayment, self)._prepare_move_line_default_vals(False)        
 
 class AccountBankStatementLine(models.Model):
     _inherit = "account.bank.statement.line"
@@ -356,11 +240,11 @@ class AccountBankStatementLine(models.Model):
             total -= aml_currency._convert(balance, currency, aml_rec.company_id, aml_rec.date)
             aml_rec.with_context(check_move_validity=False).write({'statement_line_id': self.id})
             counterpart_moves = (counterpart_moves | aml_rec.move_id)
-            if aml_rec.journal_id.post_at == 'bank_rec' and aml_rec.payment_id and aml_rec.move_id.state == 'draft':
+            if aml_rec.payment_id and aml_rec.move_id.state == 'draft':
                 # In case the journal is set to only post payments when performing bank
                 # reconciliation, we modify its date and post it.
                 aml_rec.move_id.date = self.date
-                aml_rec.payment_id.payment_date = self.date
+                aml_rec.payment_id.date = self.date
                 aml_rec.move_id.post()
                 # We check the paid status of the invoices reconciled with this payment
                 for invoice in aml_rec.payment_id.reconciled_invoice_ids:
@@ -444,10 +328,10 @@ class AccountBankStatementLine(models.Model):
 
             move.post()
             #record the move name on the statement line to be able to retrieve it in case of unreconciliation
-            self.write({'move_name': move.name})
+            self.write({'name': move.name})
             payment and payment.write({'payment_reference': move.name})
-        elif self.move_name:
-            raise UserError(_('Operation not allowed. Since your statement line already received a number (%s), you cannot reconcile it entirely with existing journal entries otherwise it would make a gap in the numbering. You should book an entry and make a regular revert of it in case you want to cancel it.') % (self.move_name))
+        elif self.name:
+            raise UserError(_('Operation not allowed. Since your statement line already received a number (%s), you cannot reconcile it entirely with existing journal entries otherwise it would make a gap in the numbering. You should book an entry and make a regular revert of it in case you want to cancel it.') % (self.name))
 
         #create the res.partner.bank if needed
         if self.account_number and self.partner_id and not self.bank_account_id:

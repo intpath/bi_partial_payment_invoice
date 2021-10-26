@@ -3,7 +3,7 @@
 
 {
     'name' : 'Invoice Partial Payment Reconciliation',
-    'version' : '13.0.0.2',
+    'version' : '14.0.0.1',
     'category' : 'Sales',
     'depends' : ['base', 
         'account', 'sale', 'sale_management', 
