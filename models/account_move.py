@@ -71,7 +71,9 @@ class AccountMoveInherit(models.Model):
 
         if not self._context.get('no_remove'):
             self.mapped('line_ids').remove_move_reconcile()
-        self.write({'state': 'draft'})
+
+        res = super(AccountMoveInherit, self).button_draft()
+        return res
 
 
     @api.model
