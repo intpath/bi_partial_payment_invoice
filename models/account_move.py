@@ -239,7 +239,7 @@ class AccountMoveLineInherit(models.Model):
     def _check_reconciliation(self):
         moves = self.mapped('move_id')
         for m in moves:
-            m.update({'state':'posted'})
+            m.action_post()
         for line in self:
             if line.matched_debit_ids or line.matched_credit_ids:
                 line.remove_move_reconcile()     
